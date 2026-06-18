@@ -79,6 +79,25 @@ def is_taiwan_stock(stock_code):
     return code.endswith(".TW") or code.endswith(".TWO") or stock_code.isdigit()
 
 
+def price_decimals(stock_code):
+    """台股 2 位小數，美股 4 位小數。"""
+    return 2 if is_taiwan_stock(stock_code) else 4
+
+
+def format_price(value, stock_code):
+    """格式化股價顯示。"""
+    if pd.isna(value):
+        return "N/A"
+    d = price_decimals(stock_code)
+    return f"${value:.{d}f}"
+
+
+def price_hover_format(stock_code):
+    """Plotly hover 用的小數格式。"""
+    d = price_decimals(stock_code)
+    return f".{d}f"
+
+
 def contains_chinese(text):
     return any("\u4e00" <= c <= "\u9fff" for c in text)
 
@@ -547,11 +566,11 @@ if df_p is not None:
     # ---- 資訊看板 (Metrics) ----
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric(label=f"最新收盤價 ({latest_date})", value=f"${latest_data['Close']:.2f}")
+        st.metric(label=f"最新收盤價 ({latest_date})", value=format_price(latest_data["Close"], ticker))
     with col2:
-        st.metric(label="20MA (月線)", value=f"${latest_data['MA20']:.2f}")
+        st.metric(label="20MA (月線)", value=format_price(latest_data["MA20"], ticker))
     with col3:
-        st.metric(label="60MA (季線)", value=f"${latest_data['MA60']:.2f}")
+        st.metric(label="60MA (季線)", value=format_price(latest_data["MA60"], ticker))
 
     # ---- 法人籌碼摘要 ----
     if has_institutional_data and not compact_mode:
@@ -585,6 +604,7 @@ if df_p is not None:
 
     # 5. 動態子圖表建立（X 軸僅顯示實際交易日，無週末／假日空白）
     x_vals, x_labels, date_to_x, tick_vals, tick_text = prepare_trading_axis(df_p.index)
+    pf = price_hover_format(ticker)
 
     fig = make_subplots(
         rows=2,
@@ -606,8 +626,11 @@ if df_p is not None:
             increasing_line_color="#d62728",
             decreasing_line_color="#2ca02c",
             customdata=x_labels,
-            hovertemplate="日期: %{customdata}<br>"
-            "開: %{open}<br>高: %{high}<br>低: %{low}<br>收: %{close}<extra></extra>",
+            hovertemplate=(
+                f"日期: %{{customdata}}<br>"
+                f"開: %{{open:{pf}}}<br>高: %{{high:{pf}}}<br>"
+                f"低: %{{low:{pf}}}<br>收: %{{close:{pf}}}<extra></extra>"
+            ),
         ),
         row=1,
         col=1,
@@ -619,7 +642,7 @@ if df_p is not None:
             name="20MA (月線)",
             line=dict(color="#ff7f0e", width=1.5, dash="dash"),
             customdata=x_labels,
-            hovertemplate="日期: %{customdata}<br>20MA: %{y:.2f}<extra></extra>",
+            hovertemplate=f"日期: %{{customdata}}<br>20MA: %{{y:{pf}}}<extra></extra>",
         ),
         row=1,
         col=1,
@@ -631,7 +654,7 @@ if df_p is not None:
             name="60MA (季線)",
             line=dict(color="#2ca02c", width=1.5, dash="dot"),
             customdata=x_labels,
-            hovertemplate="日期: %{customdata}<br>60MA: %{y:.2f}<extra></extra>",
+            hovertemplate=f"日期: %{{customdata}}<br>60MA: %{{y:{pf}}}<extra></extra>",
         ),
         row=1,
         col=1,
@@ -770,7 +793,7 @@ if df_p is not None:
         margin=dict(l=20, r=20, t=60, b=20),
         xaxis_rangeslider_visible=False,
     )
-    fig.update_yaxes(title_text="價格", row=1, col=1)
+    fig.update_yaxes(title_text="價格", tickformat=pf, row=1, col=1)
 
     if compact_mode:
         fig.update_yaxes(fixedrange=True, row=1, col=1)
