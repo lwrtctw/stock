@@ -155,6 +155,14 @@ def parse_ticker_input(raw_input):
     return code, code.split(".")[0], []
 
 
+def clean_price_df(df_price):
+    """清理 yfinance 資料：扁平化欄位並移除尚未收盤的列。"""
+    if isinstance(df_price.columns, pd.MultiIndex):
+        df_price = df_price.copy()
+        df_price.columns = df_price.columns.get_level_values(0)
+    return df_price.dropna(subset=["Close"])
+
+
 def normalize_chip_df(df_chip):
     """將 FinMind 法人資料統一為「外資 / 投信 / 自營商」欄位。"""
     if df_chip is None or df_chip.empty:
@@ -312,8 +320,9 @@ def load_all_data(stock_code, stock_num, data_period):
     if df_price.empty:
         return None, None, "empty", None
 
-    if isinstance(df_price.columns, pd.MultiIndex):
-        df_price.columns = df_price.columns.get_level_values(0)
+    df_price = clean_price_df(df_price)
+    if df_price.empty:
+        return None, None, "empty", None
 
     df_price["MA20"] = df_price["Close"].rolling(window=20).mean()
     df_price["MA60"] = df_price["Close"].rolling(window=60).mean()
