@@ -156,11 +156,47 @@ def parse_ticker_input(raw_input):
 
 
 def clean_price_df(df_price):
-    """清理 yfinance 資料：扁平化欄位並移除尚未收盤的列。"""
+    """清理 yfinance 資料：扁平化欄位並移除收盤價缺失的列。"""
     if isinstance(df_price.columns, pd.MultiIndex):
         df_price = df_price.copy()
         df_price.columns = df_price.columns.get_level_values(0)
     return df_price.dropna(subset=["Close"])
+
+
+def create_finmind_api():
+    api = DataLoader()
+    token = get_finmind_token()
+    if token:
+        api.login_by_token(api_token=token)
+    return api
+
+
+def load_taiwan_price(api, stock_num, start_date):
+    """台股股價優先使用 FinMind（yfinance 台股資料常延遲或缺漏）。"""
+    df = api.taiwan_stock_daily(stock_id=stock_num, start_date=start_date)
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df_price = pd.DataFrame(
+        {
+            "Open": df["open"],
+            "High": df["max"],
+            "Low": df["min"],
+            "Close": df["close"],
+            "Volume": df["Trading_Volume"],
+        }
+    )
+    return df_price.dropna(subset=["Close"])
+
+
+def load_yfinance_price(stock_code, start_date):
+    df_price = yf.download(stock_code, start=start_date)
+    if df_price.empty:
+        return None
+    return clean_price_df(df_price)
 
 
 def normalize_chip_df(df_chip):
@@ -316,34 +352,21 @@ def load_all_data(stock_code, stock_num, data_period):
     start_date = (
         pd.Timestamp.now() - pd.Timedelta(days=PERIOD_DAYS[data_period])
     ).strftime("%Y-%m-%d")
-    df_price = yf.download(stock_code, start=start_date)
-    if df_price.empty:
-        return None, None, "empty", None
 
-    df_price = clean_price_df(df_price)
-    if df_price.empty:
-        return None, None, "empty", None
-
-    df_price["MA20"] = df_price["Close"].rolling(window=20).mean()
-    df_price["MA60"] = df_price["Close"].rolling(window=60).mean()
-    df_price["Volume_Shares"] = df_price["Volume"] / 1000
-
+    df_price = None
     chip_status = "not_taiwan"
     chip_error = None
     df_chip = None
 
     if is_taiwan_stock(stock_code):
         try:
-            api = DataLoader()
-            token = get_finmind_token()
-            if token:
-                api.login_by_token(api_token=token)
+            api = create_finmind_api()
+            df_price = load_taiwan_price(api, stock_num, start_date)
 
             raw_chip = api.taiwan_stock_institutional_investors(
                 stock_id=stock_num,
                 start_date=start_date,
             )
-
             if raw_chip is not None and not raw_chip.empty:
                 raw_chip["net_buy"] = raw_chip["buy"] - raw_chip["sell"]
                 raw_chip["date"] = pd.to_datetime(raw_chip["date"])
@@ -355,10 +378,19 @@ def load_all_data(stock_code, stock_num, data_period):
             else:
                 chip_status = "empty"
         except Exception as exc:
-            chip_status = "error"
             chip_error = str(exc)
-    else:
-        chip_status = "not_taiwan"
+            chip_status = "error"
+            df_price = None
+
+    if df_price is None or df_price.empty:
+        df_price = load_yfinance_price(stock_code, start_date)
+
+    if df_price is None or df_price.empty:
+        return None, None, chip_status, chip_error
+
+    df_price["MA20"] = df_price["Close"].rolling(window=20).mean()
+    df_price["MA60"] = df_price["Close"].rolling(window=60).mean()
+    df_price["Volume_Shares"] = df_price["Volume"] / 1000
 
     return df_price, df_chip, chip_status, chip_error
 
