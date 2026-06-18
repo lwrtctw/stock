@@ -1,6 +1,7 @@
 import os
 
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
@@ -49,6 +50,15 @@ def find_ma_crosses(df):
 def sum_net_buy_lots(series, days):
     """累計買賣超，換算為張數。"""
     return series.tail(days).sum() / 1000
+
+
+def prepare_trading_axis(df_index):
+    """將交易日轉為連續 X 軸，去除週末與假日空白。"""
+    labels = [d.strftime("%Y-%m-%d") for d in df_index]
+    x_vals = list(range(len(labels)))
+    date_to_x = {d: i for i, d in enumerate(df_index)}
+    step = max(1, len(x_vals) // 8)
+    return x_vals, labels, date_to_x, x_vals[::step], labels[::step]
 
 
 def is_taiwan_stock(stock_code):
@@ -288,7 +298,7 @@ def evaluate_entry_signal(df_p, latest_data, crosses, df_c, has_institutional_da
     return "yellow", "🟡 進場燈號：觀望", "多空指標分歧，建議等待更明確訊號", checks
 
 
-def render_entry_light(light, title, message, checks):
+def render_entry_light(light, title, message, checks, show_details=True):
     """渲染進場燈號區塊。"""
     colors = {
         "green": ("#d4edda", "#28a745"),
@@ -306,44 +316,109 @@ def render_entry_light(light, title, message, checks):
         """,
         unsafe_allow_html=True,
     )
-    with st.expander("查看燈號判斷細項"):
-        for name, ok, detail in checks:
-            icon = "🟢" if ok else "🔴"
-            st.write(f"{icon} **{name}**：{detail}")
-        st.caption("※ 燈號僅供技術面參考，不構成投資建議。")
+    if show_details:
+        with st.expander("查看燈號判斷細項"):
+            for name, ok, detail in checks:
+                icon = "🟢" if ok else "🔴"
+                st.write(f"{icon} **{name}**：{detail}")
+            st.caption("※ 燈號僅供技術面參考，不構成投資建議。")
+
+
+def inject_responsive_css():
+    """注入手機版 RWD 樣式。"""
+    st.markdown(
+        """
+        <style>
+        @media (max-width: 768px) {
+            .block-container { padding-top: 0.75rem; padding-left: 0.75rem; padding-right: 0.75rem; }
+            section[data-testid="stSidebar"] { display: none !important; }
+            button[data-testid="stSidebarCollapsedControl"] { display: none !important; }
+            div[data-testid="stPlotlyChart"] { min-height: 380px !important; }
+            div[data-testid="stPlotlyChart"] iframe { height: 380px !important; }
+            h1 { font-size: 1.35rem !important; }
+            div[data-testid="stMetricValue"] { font-size: 1.2rem !important; }
+            div[data-testid="column"] { min-width: 100% !important; flex: 1 1 100% !important; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def inject_mobile_detect():
+    """小螢幕自動啟用手機精簡模式（透過 query param）。"""
+    components.html(
+        """
+        <script>
+        (function () {
+            const win = window.parent || window;
+            const params = new URLSearchParams(win.location.search);
+            const isMobile = win.innerWidth <= 768;
+            if (isMobile && params.get("mobile") !== "1") {
+                params.set("mobile", "1");
+                win.location.search = params.toString();
+            } else if (!isMobile && params.get("mobile") === "1") {
+                params.delete("mobile");
+                win.location.search = params.toString();
+            }
+        })();
+        </script>
+        """,
+        height=0,
+    )
 
 
 # 1. 網頁基本設定
 st.set_page_config(page_title="投資決策視覺化工具", layout="wide")
+inject_responsive_css()
+inject_mobile_detect()
 
-# 2. 側邊欄：使用者輸入參數
-st.sidebar.header("參數設定")
-ticker_input = st.sidebar.text_input(
-    "輸入股票代碼或中文名 (如 2330、台積電；美股如 AAPL)",
-    value="2330",
-)
-period = st.sidebar.selectbox(
-    "查詢區間",
-    options=list(PERIOD_DAYS.keys()),
-    index=3,
-    format_func=lambda x: PERIOD_LABELS[x],
-)
+compact_mode = st.query_params.get("mobile", "0") == "1"
+
+# 2. 主畫面查詢設定（手機無需開側邊欄）
+with st.container():
+    search_col1, search_col2 = st.columns([2, 1])
+    with search_col1:
+        ticker_input = st.text_input(
+            "輸入股票代碼或中文名 (如 2330、台積電；美股如 AAPL)",
+            value="2330",
+        )
+    with search_col2:
+        period = st.selectbox(
+            "查詢區間",
+            options=list(PERIOD_DAYS.keys()),
+            index=3,
+            format_func=lambda x: PERIOD_LABELS[x],
+        )
+
+    if compact_mode:
+        show_full = st.toggle(
+            "顯示完整資訊",
+            value=False,
+            help="顯示法人籌碼摘要、燈號細項與歷史表格",
+        )
+        compact_mode = not show_full
+    else:
+        compact_mode = st.toggle("手機精簡模式", value=False, help="精簡版面，適合小螢幕")
 
 ticker, stock_id, name_matches = parse_ticker_input(ticker_input)
 
 if len(name_matches) > 1:
-    selected = st.sidebar.selectbox(
+    selected = st.selectbox(
         "找到多筆符合，請選擇：",
         options=name_matches,
         format_func=lambda m: f"{m['stock_id']} {m['name']}",
     )
     ticker, stock_id = resolve_stock_match(selected)
 elif ticker_input.strip() and not ticker and not name_matches:
-    st.sidebar.warning(f"找不到「{ticker_input.strip()}」對應的台股標的")
+    st.warning(f"找不到「{ticker_input.strip()}」對應的台股標的")
+
 stock_display_name = get_stock_display_name(ticker, stock_id)
+chart_height = 400 if compact_mode else 650
 
 st.title(stock_display_name if stock_id else "股票趨勢與量能決策儀表板")
-st.markdown("結合 K 線、移動平均線與成交量能，加速你的波段進出場決策。")
+if not compact_mode:
+    st.markdown("結合 K 線、移動平均線與成交量能，加速你的波段進出場決策。")
 
 
 # 3. 核心資料抓取與處理函數
@@ -420,36 +495,39 @@ if df_p is not None:
     light, light_title, light_msg, light_checks = evaluate_entry_signal(
         df_p, latest_data, crosses, df_c, has_institutional_data
     )
-    render_entry_light(light, light_title, light_msg, light_checks)
-    st.sidebar.subheader("進場燈號")
-    if light == "green":
-        st.sidebar.success(light_title)
-    elif light == "red":
-        st.sidebar.error(light_title)
-    else:
-        st.sidebar.warning(light_title)
+    render_entry_light(
+        light, light_title, light_msg, light_checks, show_details=not compact_mode
+    )
 
-    # ---- 均線交叉訊號（側邊欄）----
-    st.sidebar.subheader("均線交叉訊號")
-    if pd.notna(latest_data["MA20"]) and pd.notna(latest_data["MA60"]):
-        if latest_data["MA20"] > latest_data["MA60"]:
-            st.sidebar.success("🟢 多頭排列：MA20 在 MA60 上方")
+    if not compact_mode:
+        st.sidebar.subheader("進場燈號")
+        if light == "green":
+            st.sidebar.success(light_title)
+        elif light == "red":
+            st.sidebar.error(light_title)
         else:
-            st.sidebar.warning("🔴 空頭排列：MA20 在 MA60 下方")
+            st.sidebar.warning(light_title)
 
-        if crosses:
-            last_type, last_date, _ = crosses[-1]
-            days_ago = (df_p.index[-1] - last_date).days
-            if last_type == "golden" and days_ago <= 20:
-                st.sidebar.success(
-                    f"✨ 近期黃金交叉：{last_date.strftime('%Y-%m-%d')}（{days_ago} 天前）"
-                )
-            elif last_type == "death" and days_ago <= 20:
-                st.sidebar.error(
-                    f"⚠️ 近期死亡交叉：{last_date.strftime('%Y-%m-%d')}（{days_ago} 天前）"
-                )
-    else:
-        st.sidebar.info("ℹ️ 資料不足，尚無法計算均線交叉")
+        st.sidebar.subheader("均線交叉訊號")
+        if pd.notna(latest_data["MA20"]) and pd.notna(latest_data["MA60"]):
+            if latest_data["MA20"] > latest_data["MA60"]:
+                st.sidebar.success("🟢 多頭排列：MA20 在 MA60 上方")
+            else:
+                st.sidebar.warning("🔴 空頭排列：MA20 在 MA60 下方")
+
+            if crosses:
+                last_type, last_date, _ = crosses[-1]
+                days_ago = (df_p.index[-1] - last_date).days
+                if last_type == "golden" and days_ago <= 20:
+                    st.sidebar.success(
+                        f"✨ 近期黃金交叉：{last_date.strftime('%Y-%m-%d')}（{days_ago} 天前）"
+                    )
+                elif last_type == "death" and days_ago <= 20:
+                    st.sidebar.error(
+                        f"⚠️ 近期死亡交叉：{last_date.strftime('%Y-%m-%d')}（{days_ago} 天前）"
+                    )
+        else:
+            st.sidebar.info("ℹ️ 資料不足，尚無法計算均線交叉")
 
     # ---- 資訊看板 (Metrics) ----
     col1, col2, col3 = st.columns(3)
@@ -461,7 +539,7 @@ if df_p is not None:
         st.metric(label="60MA (季線)", value=f"${latest_data['MA60']:.2f}")
 
     # ---- 法人籌碼摘要 ----
-    if has_institutional_data:
+    if has_institutional_data and not compact_mode:
         st.sidebar.success("🟢 法人籌碼數據：串接成功")
 
         st.subheader("法人籌碼摘要（張）")
@@ -490,7 +568,9 @@ if df_p is not None:
                 st.metric("三大法人近 5 日", f"{t5:+,.0f}", delta="偏多" if t5 > 0 else "偏空")
                 st.caption(f"近 20 日：{t20:+,.0f} 張")
 
-    # 5. 動態子圖表建立
+    # 5. 動態子圖表建立（X 軸僅顯示實際交易日，無週末／假日空白）
+    x_vals, x_labels, date_to_x, tick_vals, tick_text = prepare_trading_axis(df_p.index)
+
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -502,7 +582,7 @@ if df_p is not None:
     # ---- 上圖：K 線與均線 ----
     fig.add_trace(
         go.Candlestick(
-            x=df_p.index,
+            x=x_vals,
             open=df_p["Open"],
             high=df_p["High"],
             low=df_p["Low"],
@@ -510,26 +590,33 @@ if df_p is not None:
             name="K 線",
             increasing_line_color="#d62728",
             decreasing_line_color="#2ca02c",
+            customdata=x_labels,
+            hovertemplate="日期: %{customdata}<br>"
+            "開: %{open}<br>高: %{high}<br>低: %{low}<br>收: %{close}<extra></extra>",
         ),
         row=1,
         col=1,
     )
     fig.add_trace(
         go.Scatter(
-            x=df_p.index,
+            x=x_vals,
             y=df_p["MA20"],
             name="20MA (月線)",
             line=dict(color="#ff7f0e", width=1.5, dash="dash"),
+            customdata=x_labels,
+            hovertemplate="日期: %{customdata}<br>20MA: %{y:.2f}<extra></extra>",
         ),
         row=1,
         col=1,
     )
     fig.add_trace(
         go.Scatter(
-            x=df_p.index,
+            x=x_vals,
             y=df_p["MA60"],
             name="60MA (季線)",
             line=dict(color="#2ca02c", width=1.5, dash="dot"),
+            customdata=x_labels,
+            hovertemplate="日期: %{customdata}<br>60MA: %{y:.2f}<extra></extra>",
         ),
         row=1,
         col=1,
@@ -541,8 +628,8 @@ if df_p is not None:
     if golden:
         fig.add_trace(
             go.Scatter(
-                x=[d for d, _ in golden],
-                y=[p for _, p in golden],
+                x=[date_to_x[d] for d, _ in golden if d in date_to_x],
+                y=[p for d, p in golden if d in date_to_x],
                 mode="markers",
                 name="黃金交叉",
                 marker=dict(symbol="triangle-up", size=12, color="#ffd700", line=dict(width=1, color="#333")),
@@ -553,8 +640,8 @@ if df_p is not None:
     if death:
         fig.add_trace(
             go.Scatter(
-                x=[d for d, _ in death],
-                y=[p for _, p in death],
+                x=[date_to_x[d] for d, _ in death if d in date_to_x],
+                y=[p for d, p in death if d in date_to_x],
                 mode="markers",
                 name="死亡交叉",
                 marker=dict(symbol="triangle-down", size=12, color="#333", line=dict(width=1, color="#d62728")),
@@ -570,11 +657,13 @@ if df_p is not None:
             f_colors = ["#2ca02c" if val >= 0 else "#d62728" for val in foreign_data]
             fig.add_trace(
                 go.Bar(
-                    x=df_c.index,
+                    x=x_vals,
                     y=foreign_data,
                     name="外資買賣超 (張)",
                     marker_color=f_colors,
                     opacity=0.7,
+                    customdata=x_labels,
+                    hovertemplate="日期: %{customdata}<br>外資: %{y:,.0f} 張<extra></extra>",
                 ),
                 row=2,
                 col=1,
@@ -583,17 +672,19 @@ if df_p is not None:
             sitc_data = pd.Series(df_c[sitc_col]) / 1000
             fig.add_trace(
                 go.Scatter(
-                    x=df_c.index,
+                    x=x_vals,
                     y=sitc_data,
                     name="投信買賣超 (張)",
                     line=dict(color="#9467bd", width=1.8),
+                    customdata=x_labels,
+                    hovertemplate="日期: %{customdata}<br>投信: %{y:,.0f} 張<extra></extra>",
                 ),
                 row=2,
                 col=1,
             )
         fig.update_yaxes(title_text="法人買賣超 (張)", row=2, col=1)
 
-    if not has_institutional_data:
+    if not has_institutional_data and not compact_mode:
         if chip_status == "not_taiwan":
             st.sidebar.info("ℹ️ 非台股代碼，下圖顯示「市場總成交量」")
         elif chip_status == "error":
@@ -604,6 +695,8 @@ if df_p is not None:
             st.sidebar.info("ℹ️ 查無法人籌碼資料，顯示「市場總成交量」")
         else:
             st.sidebar.info("ℹ️ 法人資料不可用，顯示「市場總成交量」")
+
+    if not has_institutional_data:
         volume_colors = []
         for i in range(len(df_p)):
             if i == 0 or df_p["Close"].iloc[i] >= df_p["Close"].iloc[i - 1]:
@@ -613,16 +706,33 @@ if df_p is not None:
 
         fig.add_trace(
             go.Bar(
-                x=df_p.index,
+                x=x_vals,
                 y=df_p["Volume_Shares"],
                 name="成交量 (張)",
                 marker_color=volume_colors,
                 opacity=0.6,
+                customdata=x_labels,
+                hovertemplate="日期: %{customdata}<br>成交量: %{y:,.0f} 張<extra></extra>",
             ),
             row=2,
             col=1,
         )
         fig.update_yaxes(title_text="成交量 (張)", row=2, col=1)
+
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=tick_vals,
+        ticktext=tick_text,
+        row=1,
+        col=1,
+    )
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=tick_vals,
+        ticktext=tick_text,
+        row=2,
+        col=1,
+    )
 
     fig.update_layout(
         title=dict(
@@ -631,9 +741,16 @@ if df_p is not None:
             xanchor="center",
             font=dict(size=18),
         ),
-        height=650,
+        height=chart_height,
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.05,
+            xanchor="right",
+            x=1,
+            font=dict(size=10 if compact_mode else 12),
+        ),
         margin=dict(l=20, r=20, t=60, b=20),
         xaxis_rangeslider_visible=False,
     )
@@ -641,7 +758,8 @@ if df_p is not None:
 
     st.plotly_chart(fig, width="stretch")
 
-    with st.expander("查看歷史數據原始表格"):
-        st.dataframe(df_p.tail(10))
+    if not compact_mode:
+        with st.expander("查看歷史數據原始表格"):
+            st.dataframe(df_p.tail(10))
 else:
     st.error(f"找不到代碼「{ticker_input}」的數據，請確認代碼是否正確。")
