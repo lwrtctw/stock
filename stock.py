@@ -57,19 +57,102 @@ def is_taiwan_stock(stock_code):
     return code.endswith(".TW") or code.endswith(".TWO") or stock_code.isdigit()
 
 
-def parse_ticker_input(raw_input):
-    """將使用者輸入轉為 yfinance 代碼與 FinMind stock_id。台股可直接輸入數字。"""
-    code = raw_input.strip().upper()
-    if not code:
-        return "", ""
+def contains_chinese(text):
+    return any("\u4e00" <= c <= "\u9fff" for c in text)
 
+
+@st.cache_data(ttl=86400)
+def get_taiwan_stock_catalog():
+    """快取台股代碼、中文名稱與市場別。"""
+    try:
+        api = DataLoader()
+        token = get_finmind_token()
+        if token:
+            api.login_by_token(api_token=token)
+        df = api.taiwan_stock_info()
+        if df is None or df.empty:
+            return []
+
+        df = df.drop_duplicates(subset=["stock_id", "type"])
+        catalog = []
+        for _, row in df.iterrows():
+            market = row["type"]
+            if market == "tpex":
+                suffix = ".TWO"
+            elif market == "twse":
+                suffix = ".TW"
+            else:
+                continue
+            catalog.append(
+                {
+                    "stock_id": str(row["stock_id"]),
+                    "name": row["stock_name"],
+                    "suffix": suffix,
+                }
+            )
+        return catalog
+    except Exception:
+        return []
+
+
+def get_taiwan_stock_name_map():
+    """台股代碼 → 中文名稱對照表。"""
+    catalog = get_taiwan_stock_catalog()
+    return {item["stock_id"]: item["name"] for item in catalog}
+
+
+def search_stocks_by_name(query):
+    """依中文名稱搜尋台股，支援完整或部分比對。"""
+    catalog = get_taiwan_stock_catalog()
+    q = query.strip()
+    if not q:
+        return []
+
+    exact = [s for s in catalog if s["name"] == q]
+    if exact:
+        return exact
+
+    partial = [s for s in catalog if q in s["name"]]
+    partial.sort(key=lambda x: (not x["name"].startswith(q), len(x["name"]), x["stock_id"]))
+
+    seen = set()
+    results = []
+    for item in partial:
+        if item["stock_id"] not in seen:
+            seen.add(item["stock_id"])
+            results.append(item)
+    return results[:30]
+
+
+def resolve_stock_match(match):
+    """將搜尋結果轉為 yfinance 代碼與 stock_id。"""
+    return f"{match['stock_id']}{match['suffix']}", match["stock_id"]
+
+
+def parse_ticker_input(raw_input):
+    """將使用者輸入轉為 yfinance 代碼與 FinMind stock_id。支援數字、代碼或中文名。"""
+    raw = raw_input.strip()
+    if not raw:
+        return "", "", []
+
+    if contains_chinese(raw):
+        matches = search_stocks_by_name(raw)
+        if len(matches) == 1:
+            ticker, stock_id = resolve_stock_match(matches[0])
+            return ticker, stock_id, matches
+        return "", "", matches
+
+    code = raw.upper()
     if code.isdigit():
-        return f"{code}.TW", code
+        catalog = get_taiwan_stock_catalog()
+        match = next((s for s in catalog if s["stock_id"] == code), None)
+        suffix = match["suffix"] if match else ".TW"
+        return f"{code}{suffix}", code, []
 
     if code.endswith(".TW") or code.endswith(".TWO"):
-        return code, code.split(".")[0]
+        return code, code.split(".")[0], []
 
-    return code, code.split(".")[0]
+    return code, code.split(".")[0], []
 
 
 def normalize_chip_df(df_chip):
@@ -94,27 +177,10 @@ def get_finmind_token():
         return os.environ.get("FINMIND_TOKEN")
 
 
-@st.cache_data(ttl=86400)
-def get_taiwan_stock_name_map():
-    """快取台股代碼與中文名稱對照表。"""
-    try:
-        api = DataLoader()
-        token = get_finmind_token()
-        if token:
-            api.login_by_token(api_token=token)
-        df = api.taiwan_stock_info()
-        if df is None or df.empty:
-            return {}
-        return dict(zip(df["stock_id"].astype(str), df["stock_name"]))
-    except Exception:
-        return {}
-
-
 def get_stock_display_name(stock_code, stock_num):
     """取得標的顯示名稱（台股優先使用中文名）。"""
     if is_taiwan_stock(stock_code):
-        name_map = get_taiwan_stock_name_map()
-        cn_name = name_map.get(str(stock_num))
+        cn_name = get_taiwan_stock_name_map().get(str(stock_num))
         if cn_name:
             return f"{stock_num} {cn_name}"
     try:
@@ -127,13 +193,89 @@ def get_stock_display_name(stock_code, stock_num):
     return stock_num
 
 
+def evaluate_entry_signal(df_p, latest_data, crosses, df_c, has_institutional_data):
+    """綜合均線、交叉訊號與法人籌碼，產生進場燈號。"""
+    checks = []
+
+    if pd.notna(latest_data.get("MA20")) and pd.notna(latest_data.get("MA60")):
+        ok = latest_data["MA20"] > latest_data["MA60"]
+        checks.append(("均線排列", ok, "MA20 在 MA60 上方（多頭）" if ok else "MA20 在 MA60 下方（空頭）"))
+
+    if pd.notna(latest_data.get("MA20")):
+        ok = latest_data["Close"] > latest_data["MA20"]
+        checks.append(("站上月線", ok, "收盤價高於 20MA" if ok else "收盤價低於 20MA"))
+
+    if pd.notna(latest_data.get("MA60")):
+        ok = latest_data["Close"] > latest_data["MA60"]
+        checks.append(("站上季線", ok, "收盤價高於 60MA" if ok else "收盤價低於 60MA"))
+
+    if crosses:
+        last_type, last_date, _ = crosses[-1]
+        days_ago = (df_p.index[-1] - last_date).days
+        if days_ago <= 20:
+            if last_type == "golden":
+                checks.append(("交叉訊號", True, f"近 {days_ago} 天出現黃金交叉"))
+            else:
+                checks.append(("交叉訊號", False, f"近 {days_ago} 天出現死亡交叉"))
+
+    if has_institutional_data and df_c is not None:
+        if "外資" in df_c.columns:
+            f5 = sum_net_buy_lots(df_c["外資"], 5)
+            checks.append(("外資近 5 日", f5 > 0, f"累計 {f5:+,.0f} 張"))
+        if "投信" in df_c.columns:
+            s5 = sum_net_buy_lots(df_c["投信"], 5)
+            checks.append(("投信近 5 日", s5 > 0, f"累計 {s5:+,.0f} 張"))
+        inst_cols = [c for c in ["外資", "投信", "自營商"] if c in df_c.columns]
+        if inst_cols:
+            t5 = sum_net_buy_lots(df_c[inst_cols].sum(axis=1), 5)
+            checks.append(("三大法人近 5 日", t5 > 0, f"累計 {t5:+,.0f} 張"))
+
+    if not checks:
+        return "yellow", "🟡 進場燈號：資料不足", "查詢區間過短，請改用 3 個月以上再判斷", checks
+
+    bullish = sum(1 for _, ok, _ in checks if ok)
+    ratio = bullish / len(checks)
+    has_death = any(not ok and "死亡交叉" in detail for _, ok, detail in checks)
+
+    if ratio >= 0.7 and not has_death:
+        return "green", "🟢 進場燈號：偏多", "多項指標同步偏多，可列入進場觀察清單", checks
+    if ratio <= 0.35 or has_death:
+        return "red", "🔴 進場燈號：偏空", "趨勢偏弱或出現死亡交叉，建議暫不進場", checks
+    return "yellow", "🟡 進場燈號：觀望", "多空指標分歧，建議等待更明確訊號", checks
+
+
+def render_entry_light(light, title, message, checks):
+    """渲染進場燈號區塊。"""
+    colors = {
+        "green": ("#d4edda", "#28a745"),
+        "yellow": ("#fff3cd", "#ffc107"),
+        "red": ("#f8d7da", "#dc3545"),
+    }
+    bg, border = colors[light]
+    st.markdown(
+        f"""
+        <div style="padding:1rem 1.25rem;border-radius:8px;background:{bg};
+        border-left:6px solid {border};margin-bottom:1rem;color:#111;">
+        <h3 style="margin:0 0 0.25rem 0;color:#111;">{title}</h3>
+        <p style="margin:0;font-size:1rem;color:#111;">{message}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("查看燈號判斷細項"):
+        for name, ok, detail in checks:
+            icon = "🟢" if ok else "🔴"
+            st.write(f"{icon} **{name}**：{detail}")
+        st.caption("※ 燈號僅供技術面參考，不構成投資建議。")
+
+
 # 1. 網頁基本設定
 st.set_page_config(page_title="投資決策視覺化工具", layout="wide")
 
 # 2. 側邊欄：使用者輸入參數
-st.sidebar.header("📊 參數設定")
+st.sidebar.header("參數設定")
 ticker_input = st.sidebar.text_input(
-    "輸入股票代碼 (台股直接輸入數字，如 2330；美股如 AAPL)",
+    "輸入股票代碼或中文名 (如 2330、台積電；美股如 AAPL)",
     value="2330",
 )
 period = st.sidebar.selectbox(
@@ -143,10 +285,20 @@ period = st.sidebar.selectbox(
     format_func=lambda x: PERIOD_LABELS[x],
 )
 
-ticker, stock_id = parse_ticker_input(ticker_input)
+ticker, stock_id, name_matches = parse_ticker_input(ticker_input)
+
+if len(name_matches) > 1:
+    selected = st.sidebar.selectbox(
+        "找到多筆符合，請選擇：",
+        options=name_matches,
+        format_func=lambda m: f"{m['stock_id']} {m['name']}",
+    )
+    ticker, stock_id = resolve_stock_match(selected)
+elif ticker_input.strip() and not ticker and not name_matches:
+    st.sidebar.warning(f"找不到「{ticker_input.strip()}」對應的台股標的")
 stock_display_name = get_stock_display_name(ticker, stock_id)
 
-st.title(f"📈 {stock_display_name}" if stock_id else "📈 股票趨勢與量能決策儀表板")
+st.title(stock_display_name if stock_id else "股票趨勢與量能決策儀表板")
 st.markdown("結合 K 線、移動平均線與成交量能，加速你的波段進出場決策。")
 
 
@@ -202,7 +354,10 @@ def load_all_data(stock_code, stock_num, data_period):
     return df_price, df_chip, chip_status, chip_error
 
 
-df_p, df_c, chip_status, chip_error = load_all_data(ticker, stock_id, period)
+if ticker:
+    df_p, df_c, chip_status, chip_error = load_all_data(ticker, stock_id, period)
+else:
+    df_p, df_c, chip_status, chip_error = None, None, "empty", None
 
 # 4. 畫面渲染與圖表繪製
 if df_p is not None:
@@ -210,8 +365,31 @@ if df_p is not None:
     latest_date = df_p.index[-1].strftime("%Y-%m-%d")
     crosses = find_ma_crosses(df_p)
 
+    # ---- 法人資料預處理 ----
+    has_institutional_data = False
+    foreign_col = sitc_col = dealer_col = None
+    if df_c is not None and len(df_c) > 0:
+        df_c = df_c.reindex(df_p.index).fillna(0)
+        foreign_col = "外資" if "外資" in df_c.columns else None
+        sitc_col = "投信" if "投信" in df_c.columns else None
+        dealer_col = "自營商" if "自營商" in df_c.columns else None
+        has_institutional_data = bool(foreign_col or sitc_col or dealer_col)
+
+    # ---- 進場燈號 ----
+    light, light_title, light_msg, light_checks = evaluate_entry_signal(
+        df_p, latest_data, crosses, df_c, has_institutional_data
+    )
+    render_entry_light(light, light_title, light_msg, light_checks)
+    st.sidebar.subheader("進場燈號")
+    if light == "green":
+        st.sidebar.success(light_title)
+    elif light == "red":
+        st.sidebar.error(light_title)
+    else:
+        st.sidebar.warning(light_title)
+
     # ---- 均線交叉訊號（側邊欄）----
-    st.sidebar.subheader("📡 均線交叉訊號")
+    st.sidebar.subheader("均線交叉訊號")
     if pd.notna(latest_data["MA20"]) and pd.notna(latest_data["MA60"]):
         if latest_data["MA20"] > latest_data["MA60"]:
             st.sidebar.success("🟢 多頭排列：MA20 在 MA60 上方")
@@ -242,44 +420,34 @@ if df_p is not None:
         st.metric(label="60MA (季線)", value=f"${latest_data['MA60']:.2f}")
 
     # ---- 法人籌碼摘要 ----
-    has_institutional_data = False
-    foreign_col = sitc_col = dealer_col = None
+    if has_institutional_data:
+        st.sidebar.success("🟢 法人籌碼數據：串接成功")
 
-    if df_c is not None and len(df_c) > 0:
-        df_c = df_c.reindex(df_p.index).fillna(0)
-        foreign_col = "外資" if "外資" in df_c.columns else None
-        sitc_col = "投信" if "投信" in df_c.columns else None
-        dealer_col = "自營商" if "自營商" in df_c.columns else None
+        st.subheader("法人籌碼摘要（張）")
+        chip_cols = st.columns(3)
 
-        if foreign_col or sitc_col or dealer_col:
-            has_institutional_data = True
-            st.sidebar.success("🟢 法人籌碼數據：串接成功")
+        if foreign_col:
+            f5 = sum_net_buy_lots(df_c[foreign_col], 5)
+            f20 = sum_net_buy_lots(df_c[foreign_col], 20)
+            with chip_cols[0]:
+                st.metric("外資近 5 日", f"{f5:+,.0f}", delta="偏多" if f5 > 0 else "偏空")
+                st.caption(f"近 20 日：{f20:+,.0f} 張")
 
-            st.subheader("🏦 法人籌碼摘要（張）")
-            chip_cols = st.columns(3)
+        if sitc_col:
+            s5 = sum_net_buy_lots(df_c[sitc_col], 5)
+            s20 = sum_net_buy_lots(df_c[sitc_col], 20)
+            with chip_cols[1]:
+                st.metric("投信近 5 日", f"{s5:+,.0f}", delta="偏多" if s5 > 0 else "偏空")
+                st.caption(f"近 20 日：{s20:+,.0f} 張")
 
-            if foreign_col:
-                f5 = sum_net_buy_lots(df_c[foreign_col], 5)
-                f20 = sum_net_buy_lots(df_c[foreign_col], 20)
-                with chip_cols[0]:
-                    st.metric("外資近 5 日", f"{f5:+,.0f}", delta="偏多" if f5 > 0 else "偏空")
-                    st.caption(f"近 20 日：{f20:+,.0f} 張")
-
-            if sitc_col:
-                s5 = sum_net_buy_lots(df_c[sitc_col], 5)
-                s20 = sum_net_buy_lots(df_c[sitc_col], 20)
-                with chip_cols[1]:
-                    st.metric("投信近 5 日", f"{s5:+,.0f}", delta="偏多" if s5 > 0 else "偏空")
-                    st.caption(f"近 20 日：{s20:+,.0f} 張")
-
-            inst_cols = [c for c in [foreign_col, sitc_col, dealer_col] if c]
-            if inst_cols:
-                total_series = df_c[inst_cols].sum(axis=1)
-                t5 = sum_net_buy_lots(total_series, 5)
-                t20 = sum_net_buy_lots(total_series, 20)
-                with chip_cols[2]:
-                    st.metric("三大法人近 5 日", f"{t5:+,.0f}", delta="偏多" if t5 > 0 else "偏空")
-                    st.caption(f"近 20 日：{t20:+,.0f} 張")
+        inst_cols = [c for c in [foreign_col, sitc_col, dealer_col] if c]
+        if inst_cols:
+            total_series = df_c[inst_cols].sum(axis=1)
+            t5 = sum_net_buy_lots(total_series, 5)
+            t20 = sum_net_buy_lots(total_series, 20)
+            with chip_cols[2]:
+                st.metric("三大法人近 5 日", f"{t5:+,.0f}", delta="偏多" if t5 > 0 else "偏空")
+                st.caption(f"近 20 日：{t20:+,.0f} 張")
 
     # 5. 動態子圖表建立
     fig = make_subplots(
