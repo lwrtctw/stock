@@ -61,6 +61,18 @@ def prepare_trading_axis(df_index):
     return x_vals, labels, date_to_x, x_vals[::step], labels[::step]
 
 
+def get_chart_config(compact_mode):
+    """手機版：關閉縮放，保留拖曳平移。"""
+    if not compact_mode:
+        return {}
+    return {
+        "scrollZoom": False,
+        "displayModeBar": False,
+        "doubleClick": False,
+        "showTips": False,
+    }
+
+
 def is_taiwan_stock(stock_code):
     """判斷是否為台股（FinMind 法人資料僅支援台股）。"""
     code = stock_code.upper()
@@ -334,7 +346,10 @@ def inject_responsive_css():
             section[data-testid="stSidebar"] { display: none !important; }
             button[data-testid="stSidebarCollapsedControl"] { display: none !important; }
             div[data-testid="stPlotlyChart"] { min-height: 380px !important; }
-            div[data-testid="stPlotlyChart"] iframe { height: 380px !important; }
+            div[data-testid="stPlotlyChart"] iframe {
+                height: 380px !important;
+                touch-action: pan-x !important;
+            }
             h1 { font-size: 1.35rem !important; }
             div[data-testid="stMetricValue"] { font-size: 1.2rem !important; }
             div[data-testid="column"] { min-width: 100% !important; flex: 1 1 100% !important; }
@@ -743,6 +758,7 @@ if df_p is not None:
         ),
         height=chart_height,
         hovermode="x unified",
+        dragmode="pan" if compact_mode else "zoom",
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -756,7 +772,18 @@ if df_p is not None:
     )
     fig.update_yaxes(title_text="價格", row=1, col=1)
 
-    st.plotly_chart(fig, width="stretch")
+    if compact_mode:
+        fig.update_yaxes(fixedrange=True, row=1, col=1)
+        fig.update_yaxes(fixedrange=True, row=2, col=1)
+        visible_bars = 40
+        if len(x_vals) > visible_bars:
+            x0 = len(x_vals) - visible_bars - 0.5
+            x1 = len(x_vals) - 0.5
+            fig.update_xaxes(range=[x0, x1], row=1, col=1)
+            fig.update_xaxes(range=[x0, x1], row=2, col=1)
+        st.caption("👉 左右拖曳查看歷史 K 線（手機版已關閉縮放）")
+
+    st.plotly_chart(fig, width="stretch", config=get_chart_config(compact_mode))
 
     if not compact_mode:
         with st.expander("查看歷史數據原始表格"):
